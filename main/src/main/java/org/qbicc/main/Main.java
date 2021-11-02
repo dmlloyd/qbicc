@@ -1,22 +1,35 @@
 package org.qbicc.main;
 
+import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Optional;
 import java.util.ServiceConfigurationError;
 import java.util.ServiceLoader;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Consumer;
 
+import org.jboss.shrinkwrap.resolver.api.ResolutionException;
+import org.jboss.shrinkwrap.resolver.api.maven.Maven;
+import org.jboss.shrinkwrap.resolver.api.maven.MavenResolvedArtifact;
+import org.jboss.shrinkwrap.resolver.api.maven.PackagingType;
+import org.jboss.shrinkwrap.resolver.api.maven.ScopeType;
+import org.jboss.shrinkwrap.resolver.api.maven.coordinate.MavenCoordinate;
+import org.jboss.shrinkwrap.resolver.api.maven.coordinate.MavenCoordinates;
+import org.jboss.shrinkwrap.resolver.api.maven.coordinate.MavenDependencies;
 import org.qbicc.context.CompilationContext;
 import org.qbicc.context.Diagnostic;
 import org.qbicc.context.DiagnosticContext;
 import org.qbicc.driver.BaseDiagnosticContext;
 import org.qbicc.driver.BuilderStage;
+import org.qbicc.driver.ClassPathElement;
+import org.qbicc.driver.ClassPathItem;
 import org.qbicc.driver.Driver;
 import org.qbicc.driver.ElementBodyCopier;
 import org.qbicc.driver.ElementBodyCreator;
@@ -119,7 +132,8 @@ import picocli.CommandLine.ParseResult;
  * The main entry point, which can be constructed using a builder or directly invoked.
  */
 public class Main implements Callable<DiagnosticContext> {
-    private final List<Path> bootModulePath;
+    private final List<ClassPathEntry> bootPaths;
+    private final List<ClassPathEntry> appPaths;
     private final Path outputPath;
     private final Consumer<Iterable<Diagnostic>> diagnosticsHandler;
     private final String mainClass;
@@ -134,7 +148,8 @@ public class Main implements Callable<DiagnosticContext> {
     private final boolean smallTypeIds;
 
     Main(Builder builder) {
-        bootModulePath = List.copyOf(builder.bootModulePath);
+        bootPaths = List.copyOf(builder.bootPaths);
+        appPaths = List.copyOf(builder.appPaths);
         outputPath = builder.outputPath;
         diagnosticsHandler = builder.diagnosticsHandler;
         // todo: this becomes optional
@@ -162,14 +177,20 @@ public class Main implements Callable<DiagnosticContext> {
         return ctxt;
     }
 
-    DiagnosticContext call0(BaseDiagnosticContext initialContext) {
+    void call0(BaseDiagnosticContext initialContext) {
         final Driver.Builder builder = Driver.builder();
         builder.setInitialContext(initialContext);
         boolean nogc = gc.equals("none");
         int errors = initialContext.errors();
         if (errors == 0) {
             builder.setOutputDirectory(outputPath);
-            builder.addBootClassPathElements(bootModulePath);
+            // process the class paths
+            try {
+                resolveClassPath(builder::addBootClassPathItem, bootPaths);
+            } catch (IOException e) {
+                // todo: close class path items?
+                return;
+            }
             // first, probe the target platform
             Platform target = platform;
             builder.setTargetPlatform(target);
@@ -450,7 +471,44 @@ public class Main implements Callable<DiagnosticContext> {
                 }
             }
         }
-        return initialContext;
+        return;
+    }
+
+    private void resolveClassPath(Consumer<ClassPathItem> classPathItemConsumer, final List<ClassPathEntry> bootPaths) throws IOException {
+        Set<MavenCoordinate> addedCoordinates = new HashSet<>();
+        for (ClassPathEntry bootPath : bootPaths) {
+            if (bootPath instanceof ClassPathEntry.FilePath fp) {
+                classPathItemConsumer.accept(new ClassPathItem(fp.getPath().toString(), List.of(ClassPathElement.forDirectory(fp.getPath())), List.of()));
+            } else if (bootPath instanceof ClassPathEntry.MavenArtifact ma) try {
+                // todo: work offline switch
+                MavenResolvedArtifact[] artifacts = Maven.configureResolver().withMavenCentralRepo(true).addDependency(MavenDependencies.createDependency(ma.getArtifact(), null, false)).resolve().withTransitivity().asResolvedArtifact();
+                for (MavenResolvedArtifact artifact : artifacts) {
+                    // try to avoid duplication to a reasonable extent
+                    MavenCoordinate coordinate = artifact.getCoordinate();
+                    if (addedCoordinates.add(coordinate)) {
+                        // try to get the source artifact for debug info
+                        List<ClassPathElement> sourceList;
+                        MavenCoordinate sourceCoordinate = MavenCoordinates.createCoordinate(coordinate.getGroupId(), coordinate.getArtifactId(), coordinate.getVersion(), PackagingType.JAVA_SOURCE, coordinate.getClassifier());
+                        try {
+                            MavenResolvedArtifact sourceArtifact = Maven.resolver().addDependency(MavenDependencies.createDependency(sourceCoordinate, ScopeType.COMPILE, false)).resolve().withoutTransitivity().asSingleResolvedArtifact();
+                            sourceList = List.of(ClassPathElement.forJarFile(sourceArtifact.asFile()));
+                        } catch (ResolutionException ignored) {
+                            // no source item
+                            sourceList = List.of();
+                        }
+                        File file = artifact.asFile();
+                        // skip non-JAR things like POMs
+                        if (file.getName().endsWith(".jar")) {
+                            classPathItemConsumer.accept(new ClassPathItem(coordinate.toCanonicalForm(), List.of(ClassPathElement.forJarFile(file)), sourceList));
+                        }
+                    }
+                }
+            } catch (ResolutionException e) {
+                System.err.printf("Failed to resolve Maven artifact %s: ", ma.getArtifact().toCanonicalForm());
+                e.printStackTrace(System.err);
+                throw new IOException(e);
+            }
+        }
     }
 
     public static void main(String[] args) {
@@ -461,7 +519,8 @@ public class Main implements Callable<DiagnosticContext> {
             return;
         }
         Builder mainBuilder = builder();
-        mainBuilder.setBootModulePaths(optionsProcessor.bootPaths)
+        mainBuilder.addBootPaths(optionsProcessor.bootPathEntries)
+            .addAppPaths(optionsProcessor.appPathEntries)
             .setOutputPath(optionsProcessor.outputPath)
             .setMainClass(optionsProcessor.mainClass)
             .setDiagnosticsHandler(diagnostics -> {
@@ -525,8 +584,15 @@ public class Main implements Callable<DiagnosticContext> {
             }
         }
 
-        @CommandLine.Option(names = "--boot-module-path", required = true, split=":")
-        private String[] bootPaths;
+        // todo: multiple option support to support file path artifacts as well, https://github.com/remkop/picocli/issues/1451
+        //@CommandLine.Option(names = "--boot-path-file", converter = ClassPathEntry.FilePath.Converter.class)
+        @CommandLine.Option(names = "--boot-path-artifact", converter = ClassPathEntry.MavenArtifact.Converter.class)
+        private List<ClassPathEntry> bootPathEntries = new ArrayList<>();
+
+        //@CommandLine.Option(names = "--app-path-file", converter = ClassPathEntry.FilePath.Converter.class)
+        @CommandLine.Option(names = "--app-path-artifact", converter = ClassPathEntry.MavenArtifact.Converter.class)
+        private List<ClassPathEntry> appPathEntries = new ArrayList<>();
+
         @CommandLine.Option(names = "--output-path", description = "Specify directory where the executable is placed")
         private Path outputPath;
         @CommandLine.Option(names = "--debug")
@@ -660,7 +726,8 @@ public class Main implements Callable<DiagnosticContext> {
     }
 
     public static final class Builder {
-        private final List<Path> bootModulePath = new ArrayList<>();
+        private final List<ClassPathEntry> bootPaths = new ArrayList<>();
+        private final List<ClassPathEntry> appPaths = new ArrayList<>();
         private Path outputPath;
         private Consumer<Iterable<Diagnostic>> diagnosticsHandler = diagnostics -> {};
         private Platform platform = Platform.HOST_PLATFORM;
@@ -677,25 +744,27 @@ public class Main implements Callable<DiagnosticContext> {
 
         Builder() {}
 
-        public Builder addBootModulePath(Path path) {
-            Assert.checkNotNullParam("path", path);
-            bootModulePath.add(path);
+        public Builder addBootPath(ClassPathEntry entry) {
+            Assert.checkNotNullParam("entry", entry);
+            bootPaths.add(entry);
             return this;
         }
 
-        public Builder addBootModulePaths(List<Path> paths) {
-            Assert.checkNotNullParam("paths", paths);
-            bootModulePath.addAll(paths);
+        public Builder addBootPaths(List<ClassPathEntry> entry) {
+            Assert.checkNotNullParam("entry", entry);
+            bootPaths.addAll(entry);
             return this;
         }
 
-        public Builder setBootModulePaths(String[] paths) {
-            Assert.checkNotNullParam("paths", paths);
-            for (String pathStr : paths) {
-                if (! pathStr.isEmpty()) {
-                    addBootModulePath(Path.of(pathStr));
-                }
-            }
+        public Builder addAppPath(ClassPathEntry entry) {
+            Assert.checkNotNullParam("entry", entry);
+            appPaths.add(entry);
+            return this;
+        }
+
+        public Builder addAppPaths(List<ClassPathEntry> entry) {
+            Assert.checkNotNullParam("entry", entry);
+            appPaths.addAll(entry);
             return this;
         }
 
